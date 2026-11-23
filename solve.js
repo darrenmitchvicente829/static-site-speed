@@ -696,13 +696,17 @@ export function build(input) {
 const BAIL = new Error('not read by the byte path');
 const DEBUG = process.env.MAKEFUN_SITE_DEBUG === '1';
 
-// [ input | answer | kept bytes | path workspace | the page being rendered ]
+// [ input | the answer being written (flushed to the file as it fills) | kept bytes | path workspace | the page being rendered ]
 let BUF = Buffer.alloc(16);
 let B = new Uint8Array(BUF.buffer, BUF.byteOffset, 16);
 let IN = BUF; // the input alone: a search that finds nothing ends with it
 let SIZE = 0;
 let OUT0 = 0;
 let OUT1 = 0;
+let OUT_FLUSH = 0; // past this, the answer written so far goes to the file
+let outFd = -1;
+let outFile = '';
+let failed = false; // a case the byte path did not answer: answers() then answers them all with build()
 let SCR0 = 0;
 let SCR1 = 0;
 let TMP0 = 0;
@@ -756,13 +760,19 @@ const K_REPORT_KEY = bytes('"build-report.txt":"');
 const K_KEYS = KEYS.map(bytes);
 const K_MONTHS = MONTHS.map(bytes);
 
-function lit(u, h, k) {
-  for (let i = 0; i < k.length; i++) u[h + i] = k[i];
-  return h + k.length;
+// The kernels: the few loops that touch every byte. They are small, so the optimizing compiler takes them quickly, and
+// prime() runs each over every branch before it is asked to (tune.js), so none is compiled twice.
+
+/** Bytes written out: a constant at h. */
+function k_lit(u, h, k) {
+  const n = k.length;
+  for (let i = 0; i < n; i++) u[h + i] = k[i];
+  return h + n;
 }
 
-function cpy(u, h, a, n) {
-  if (n < 32) for (let k = 0; k < n; k++) u[h + k] = u[a + k];
+/** n bytes from a copied to h. */
+function k_cpy(u, h, a, n) {
+  if (n < 96) for (let k = 0; k < n; k++) u[h + k] = u[a + k];
   else u.copyWithin(h, a, a + n);
   return h + n;
 }
@@ -862,155 +872,228 @@ function wordAt(u, p) {
   return n > 34 || n === 33;
 }
 
+// What k_scan does with a byte.
+const T_SPC = 1;
+const T_AMP = 2; // 2 to 6: written as an entity
+const T_LT = 3;
+const T_GT = 4;
+const T_APOS = 5;
+const T_QUOT = 6;
+const T_BSL = 7; // a backslash: a quote after it is read
+const T_BSLP = 8; // a backslash where a paragraph's plain line breaks are read too
+const T_NL = 9;
+const T_FILL = 10;
+const T_STOP = 11;
+const ENT = bytes('&amp;\0&lt;\0&gt;\0&#39;\0&quot;\0');
+const ENT_AT = new Uint8Array(8);
+ENT_AT[T_LT] = 6;
+ENT_AT[T_GT] = 11;
+ENT_AT[T_APOS] = 16;
+ENT_AT[T_QUOT] = 22;
+const TI = new Uint8Array(256); // a block's text: stops at what may open a mark
+const TE = new Uint8Array(256); // code: escaped and nothing else
+const TA = new Uint8Array(256); // any JSON string bytes, escaped: no words counted
+// A line that starts on one of these may end a paragraph (a blank line, a fence, a heading, a break) or opens on
+// spaces to drop: any other first byte plainly continues it.
+const START = new Uint8Array(256);
+const TAGX = new Uint8Array(256); // what makes a tag list more than names, commas and spaces
+for (let i = 0; i < 256; i++) {
+  const c = CLS[i];
+  const t = c === PLAIN ? 0 : c === SPC ? T_SPC : c === AMP ? T_AMP : c === LT ? T_LT : c === GT ? T_GT : c === APOS ? T_APOS : c === BSL ? T_BSLP : c === NL ? T_NL : c === FILL ? T_FILL : T_STOP;
+  TI[i] = t;
+  TE[i] = c === TICK || c === STAR || c === LBR ? 0 : t;
+  TA[i] = t === T_AMP || t === T_LT || t === T_GT || t === T_APOS ? t : c === BSL ? T_BSL : 0;
+  START[i] = i < 33 || i === 34 || i === 92 || i === 35 || i === 96 || i === 45 || i === 42 ? 1 : 0;
+  TAGX[i] = i === 92 || i === 91 || i === 93 || c === UNI ? 1 : 0;
+}
+
+/**
+ * Bytes from p written at h under table t, escaped as HTML asks: as far as it can go. Returns where it stopped (b, or
+ * a byte the table stops at, or a backslash it does not read: one that is no quote and no plain line break of a
+ * paragraph) and leaves where it wrote to in hp; words it met are added to words.
+ */
+function k_scan(u, p, b, h, t) {
+  let w = 0;
+  while (p < b) {
+    const c = u[p];
+    let k = t[c];
+    if (k === 0) {
+      u[h++] = c;
+      p++;
+      continue;
+    }
+    if (k === T_SPC) {
+      u[h++] = 32;
+      p++;
+      // A word opens after it unless a space, a tab, a line end or the end of the text follows.
+      const n = u[p];
+      if (n > 34) {
+        if (n !== 92) w++;
+        else {
+          const e = u[p + 1];
+          if (e !== 116 && e !== 110 && e !== 114) w++;
+        }
+      } else if (n === 33) w++;
+      continue;
+    }
+    if (k >= T_BSL) {
+      if (k === T_NL) {
+        u[h] = 92; u[h + 1] = 110;
+        h += 2;
+        p++;
+        w++;
+        continue;
+      }
+      if (k === T_FILL) {
+        p++;
+        continue;
+      }
+      if (k === T_STOP) break;
+      const e = u[p + 1];
+      if (e === 34) {
+        k = T_QUOT;
+        p++;
+      } else if (k === T_BSLP && e === 110 && p + 2 < b && START[u[p + 2]] === 0 && u[p - 1] !== 32 && (u[p - 1] !== 116 || u[p - 2] !== 92)) {
+        // A paragraph's line break with nothing to drop around it and a next line that plainly continues it.
+        u[h] = 92; u[h + 1] = 110;
+        h += 2;
+        p += 2;
+        w++;
+        continue;
+      } else break;
+    }
+    // & < > ' or a quote: its entity
+    let q = ENT_AT[k];
+    let x = ENT[q];
+    do {
+      u[h++] = x;
+      x = ENT[++q];
+    } while (x !== 0);
+    p++;
+  }
+  words += w;
+  hp = h;
+  return p;
+}
+
 /** JSON string bytes HTML-escaped at h; the end of what was written. */
 function escTo(u, h, a, b) {
-  for (let p = a; p < b; p++) {
-    const c = u[p];
-    if (c === 38) {
-      u[h] = 38; u[h + 1] = 97; u[h + 2] = 109; u[h + 3] = 112; u[h + 4] = 59;
-      h += 5;
-    } else if (c === 60) {
-      u[h] = 38; u[h + 1] = 108; u[h + 2] = 116; u[h + 3] = 59;
-      h += 4;
-    } else if (c === 62) {
-      u[h] = 38; u[h + 1] = 103; u[h + 2] = 116; u[h + 3] = 59;
-      h += 4;
-    } else if (c === 39) {
-      u[h] = 38; u[h + 1] = 35; u[h + 2] = 51; u[h + 3] = 57; u[h + 4] = 59;
-      h += 5;
-    } else if (c === 92) {
-      const e = u[++p];
-      if (e === 34) {
-        u[h] = 38; u[h + 1] = 113; u[h + 2] = 117; u[h + 3] = 111; u[h + 4] = 116; u[h + 5] = 59;
-        h += 6;
-      } else if (e === 117) throw BAIL;
-      else {
-        u[h] = 92; u[h + 1] = e;
-        h += 2;
-      }
-    } else u[h++] = c;
+  const kept = words;
+  let p = a;
+  for (;;) {
+    p = k_scan(u, p, b, h, TA);
+    h = hp;
+    if (p >= b) break;
+    // a backslash that is no quote: the escape as it stands
+    const e = u[p + 1];
+    if (e === 117) throw BAIL;
+    u[h] = 92; u[h + 1] = e;
+    h += 2;
+    p += 2;
   }
+  words = kept;
   return h;
 }
 
 /** A run of a body escaped at hp and nothing else, its words counted. */
 function escSpan(a, b) {
   const u = B;
-  let h = hp;
   let p = a;
-  while (p < b) {
+  for (;;) {
+    p = k_scan(u, p, b, hp, TE);
+    if (p >= b) return;
     const c = u[p];
-    switch (ECLS[c]) {
-      case PLAIN:
-        u[h++] = c;
-        p++;
-        break;
-      case SPC:
-        u[h++] = 32;
-        p++;
-        if (wordAt(u, p)) words++;
-        break;
-      case AMP:
-        u[h] = 38; u[h + 1] = 97; u[h + 2] = 109; u[h + 3] = 112; u[h + 4] = 59;
-        h += 5;
-        p++;
-        break;
-      case LT:
-        u[h] = 38; u[h + 1] = 108; u[h + 2] = 116; u[h + 3] = 59;
-        h += 4;
-        p++;
-        break;
-      case GT:
-        u[h] = 38; u[h + 1] = 103; u[h + 2] = 116; u[h + 3] = 59;
-        h += 4;
-        p++;
-        break;
-      case APOS:
-        u[h] = 38; u[h + 1] = 35; u[h + 2] = 51; u[h + 3] = 57; u[h + 4] = 59;
-        h += 5;
-        p++;
-        break;
-      case BSL: {
-        const e = u[p + 1];
-        p += 2;
-        if (e === 34) {
-          u[h] = 38; u[h + 1] = 113; u[h + 2] = 117; u[h + 3] = 111; u[h + 4] = 116; u[h + 5] = 59;
-          h += 6;
-        } else if (e === 92) {
-          u[h] = 92; u[h + 1] = 92;
-          h += 2;
-        } else if (e === 116) {
-          u[h] = 92; u[h + 1] = 116;
-          h += 2;
-          if (wordAt(u, p)) words++;
-        } else throw BAIL;
-        break;
+    if (c === 92) {
+      const e = u[p + 1];
+      if (e === 110 || e === 114) {
+        p = lineBreak(u, p, b);
+        if (p < 0) throw BAIL;
+        continue;
       }
-      case NL:
-        u[h] = 92; u[h + 1] = 110;
-        h += 2;
-        p++;
-        words++;
-        break;
-      case FILL:
-        p++;
-        break;
-      case UNI:
-        if (uniWs(u, p)) throw BAIL;
-        u[h++] = c;
-        p++;
-        break;
-      default:
-        throw BAIL;
+      p += 2;
+      if (e === 92) {
+        u[hp] = 92; u[hp + 1] = 92;
+        hp += 2;
+      } else if (e === 116) {
+        u[hp] = 92; u[hp + 1] = 116;
+        hp += 2;
+        if (wordAt(u, p)) words++;
+      } else throw BAIL;
+    } else if (CLS[c] === UNI && !uniWs(u, p)) {
+      u[hp++] = c;
+      p++;
+    } else throw BAIL;
+  }
+}
+
+/**
+ * The first place from j, before b, where a mark closes, or -1. kind 0: the byte ch outside an escape; 1: ch standing
+ * alone (not doubled), outside an escape; 2: ch doubled, outside an escape; 3: the byte ch wherever it is; 4: a byte
+ * that may be a space (a space, a line break, a backslash or one outside ASCII); 5: a byte no plain path holds (not
+ * printable ASCII, a quote or a backslash); 6: a byte a string is escaped for, or an escape; 7: a byte that makes a
+ * tag list more than names, commas and spaces. A search reads on over a paragraph's line break where the next line
+ * plainly continues the paragraph; at any other line break at j it answers -2 - j.
+ */
+function k_find(u, j, b, kind, ch) {
+  if (kind >= 4) {
+    if (kind === 4) {
+      for (; j < b; j++) {
+        const c = u[j];
+        if (c <= 32 || c === 92 || c >= 0xc2) return j;
+      }
+    } else if (kind === 5) {
+      for (; j < b; j++) {
+        const c = u[j];
+        if (c < 32 || c > 126 || c === 34 || c === 92) return j;
+      }
+    } else if (kind === 6) {
+      for (; j < b; j++) {
+        const c = u[j];
+        if (c === 92 || c === 38 || c === 60 || c === 62 || c === 39) return j;
+      }
+    } else {
+      for (; j < b; j++) if (TAGX[u[j]] !== 0) return j;
     }
+    return -1;
   }
-  hp = h;
-}
-
-/** Skips what a backslash at j holds, as a search for a closing mark reads it: an escape takes its character with it. */
-function skipEscape(u, j, b) {
-  if (u[j + 1] !== 92) return j + 2; // a quote or a tab of the text
-  if (j + 2 < b) {
-    const f = u[j + 2];
-    if (f === 92) {
-      if (u[j + 3] === 92) return j + 4;
-    } else if (MDESC[f] === 1) return j + 3;
-  }
-  return j + 2;
-}
-
-function findDouble(u, from, b) {
-  let j = from;
-  while (j + 1 < b) {
-    const c = u[j];
-    if (c === 92) j = skipEscape(u, j, b);
-    else if (c === 42 && u[j + 1] === 42) return j;
-    else j++;
-  }
-  return -1;
-}
-
-function findSingle(u, from, b) {
-  let j = from;
   while (j < b) {
     const c = u[j];
-    if (c === 92) j = skipEscape(u, j, b);
-    else if (c !== 42) j++;
-    else if (j + 1 < b && u[j + 1] === 42) j += 2;
-    else return j;
+    if (c === 92) {
+      const e = u[j + 1];
+      if (e === 110 || e === 114) {
+        if (e === 110 && j + 2 < b && START[u[j + 2]] === 0) j += 2;
+        else return -2 - j;
+      } else if (kind === 3) j += 2;
+      else if (e === 92 && j + 2 < b) {
+        // An escape takes its character with it: a backslash of the text before one of the characters it escapes.
+        const f = u[j + 2];
+        if (f === 92) j += u[j + 3] === 92 ? 4 : 2;
+        else j += MDESC[f] === 1 ? 3 : 2;
+      } else j += 2;
+    } else if (c === ch) {
+      if (kind === 0 || kind === 3) return j;
+      const doubled = j + 1 < b && u[j + 1] === ch;
+      if (kind === 1) {
+        if (!doubled) return j;
+        j += 2;
+      } else if (doubled) return j;
+      else j++;
+    } else j++;
   }
   return -1;
 }
 
-function findClose(u, from, b) {
-  let j = from;
-  while (j < b) {
-    const c = u[j];
-    if (c === 92) j = skipEscape(u, j, b);
-    else if (c === 93) return j;
-    else j++;
+/** k_find over the line breaks of a paragraph: a search ends where the paragraph does. */
+function find(u, j, b, kind, ch) {
+  for (;;) {
+    const r = k_find(u, j, b, kind, ch);
+    if (r >= -1) return r;
+    const p = -2 - r;
+    let n = p + 2;
+    if (u[p + 1] === 114 && u[n] === 92 && u[n + 1] === 110) n += 2;
+    if (n >= b || endsAt(u, n)) return -1;
+    j = n;
   }
-  return -1;
 }
 
 /** Whether a link's target holds no space. */
@@ -1020,11 +1103,74 @@ function noSpace(u, a, b) {
     if (c === 32 || c === 10) return false;
     if (c === 92) {
       const e = u[++p];
-      if (e === 116) return false;
+      if (e === 116 || e === 110 || e === 114) return false;
       if (e !== 34 && e !== 92) throw BAIL;
     } else if (CLS[c] === UNI && uniWs(u, p)) return false;
   }
   return true;
+}
+
+let curCE = 0; // where the body being rendered ends
+let pEnd = -1; // where the block after a paragraph starts, once a line break has ended the paragraph
+
+/** Whether the line at n ends a paragraph: a blank line, a fence, a heading or a break. */
+function endsAt(u, n) {
+  const c = u[n];
+  if (c === 92) {
+    const e = u[n + 1];
+    if (e === 110 || e === 114) return true;
+    if (e !== 116) return false;
+  } else if (c === 34) {
+    if (n >= curCE) return true;
+    return false;
+  } else if (c !== 32 && c !== 96 && c !== 35 && c !== 45 && c !== 42) return false;
+  eol(u, n, curCE);
+  return endsParagraph(u, n, le);
+}
+
+/** What was written, less the spaces and tabs it ends on: a line's are dropped. */
+function untrail(u, h) {
+  for (;;) {
+    const c = u[h - 1];
+    if (c === 32) h--;
+    else if (c === 116 && u[h - 2] === 92) {
+      // a tab only when its backslash is not itself an escaped one
+      let k = h - 2;
+      while (u[k] === 92) k--;
+      if (((h - 2 - k) & 1) === 0) break;
+      h -= 2;
+    } else break;
+  }
+  return h;
+}
+
+/**
+ * A line break of a paragraph at p, inside the run that ends at b: the spaces around it dropped. Where the paragraph
+ * goes on, the break is written and the next line's text is where to read on; where the next line ends the
+ * paragraph, pEnd is that line and the answer is -1.
+ */
+function lineBreak(u, p, b) {
+  let n = p + 2;
+  if (u[p + 1] === 114 && u[n] === 92 && u[n + 1] === 110) n += 2;
+  let h = untrail(u, hp);
+  if (n < b || b < curCE) {
+    if (n < b) {
+      if (endsAt(u, n)) {
+        hp = h;
+        pEnd = n;
+        return -1;
+      }
+      n = skipWs(u, n, b);
+    } else n = b;
+    u[h] = 92; u[h + 1] = 110;
+    hp = h + 2;
+    words++;
+    return n;
+  }
+  // the body ends on this line break
+  hp = h;
+  pEnd = n;
+  return -1;
 }
 
 let curF = 0; // the source being rendered: its row
@@ -1042,23 +1188,26 @@ function href(a, b) {
     return;
   }
   if ((c0 | 32) >= 97 && (c0 | 32) <= 122) {
-    let q = a + 1;
-    while (q < b && SCHEME[u[q]] !== 0) q++;
-    if (q < b && u[q] === 58) {
-      hp = escTo(u, hp, a, b);
-      return;
+    // A scheme: nothing but what a scheme holds before the first colon.
+    const colon = k_find(u, a, b, 3, 58);
+    if (colon > 0) {
+      let q = a + 1;
+      while (q < colon && SCHEME[u[q]] !== 0) q++;
+      if (q === colon) {
+        hp = escTo(u, hp, a, b);
+        return;
+      }
     }
   }
-  let hash = a;
-  while (hash < b && u[hash] !== 35) hash++;
+  let hash = k_find(u, a, b, 3, 35);
+  if (hash < 0) hash = b;
   // The path it names, from the source's directory.
-  let t = TMP0;
-  for (let k = F[curF + PS]; k < curDir; k++) u[t++] = u[k];
+  let t = k_cpy(u, TMP0, F[curF + PS], curDir - F[curF + PS]);
   let ok = true;
   let s = a;
   while (s < hash) {
-    let e = s;
-    while (e < hash && u[e] !== 47) e++;
+    let e = k_find(u, s, hash, 3, 47);
+    if (e < 0) e = hash;
     const n = e - s;
     if (n === 2 && u[s] === 46 && u[s + 1] === 46) {
       if (t === TMP0) {
@@ -1070,16 +1219,16 @@ function href(a, b) {
     } else if (n !== 0 && !(n === 1 && u[s] === 46)) {
       if (t + n + 1 > TMP1) throw BAIL;
       if (t > TMP0) u[t++] = 47;
-      for (let k = s; k < e; k++) u[t++] = u[k];
+      t = k_cpy(u, t, s, n);
     }
     s = e + 1;
   }
   if (ok) {
-    const v = find(u, TMP0, t - TMP0);
+    const v = k_lookup(u, TMP0, t - TMP0, HT, hMask, F);
     if (v >= 0) {
-      if (F[v + ST] === 0) hp = cpy(u, hp, F[v + UEO], F[v + UEL]);
+      if (F[v + ST] === 0) hp = k_cpy(u, hp, F[v + UEO], F[v + UEL]);
       else {
-        hp = cpy(u, hp, BASE_EO, BASE_EL);
+        hp = k_cpy(u, hp, BASE_EO, BASE_EL);
         u[hp++] = 47;
         hp = escTo(u, hp, TMP0, t);
       }
@@ -1108,52 +1257,27 @@ function href(a, b) {
   hp = escTo(u, hp, a, b);
 }
 
-/** A block's text rendered inline at hp. */
+/**
+ * A block's text rendered inline at hp. A paragraph's run is handed over to the end of the body: it ends at the line
+ * break that ends the paragraph (pEnd is then the line after it).
+ */
 function inl(a, b) {
   const u = B;
-  let h = hp;
   let p = a;
-  while (p < b) {
+  for (;;) {
+    p = k_scan(u, p, b, hp, TI);
+    if (p >= b) return;
     const c = u[p];
-    const k = CLS[c];
-    if (k === PLAIN) {
-      u[h++] = c;
-      p++;
-      continue;
-    }
-    switch (k) {
-      case SPC:
-        u[h++] = 32;
-        p++;
-        if (wordAt(u, p)) words++;
-        break;
-      case AMP:
-        u[h] = 38; u[h + 1] = 97; u[h + 2] = 109; u[h + 3] = 112; u[h + 4] = 59;
-        h += 5;
-        p++;
-        break;
-      case LT:
-        u[h] = 38; u[h + 1] = 108; u[h + 2] = 116; u[h + 3] = 59;
-        h += 4;
-        p++;
-        break;
-      case GT:
-        u[h] = 38; u[h + 1] = 103; u[h + 2] = 116; u[h + 3] = 59;
-        h += 4;
-        p++;
-        break;
-      case APOS:
-        u[h] = 38; u[h + 1] = 35; u[h + 2] = 51; u[h + 3] = 57; u[h + 4] = 59;
-        h += 5;
-        p++;
-        break;
+    let h = hp;
+    switch (CLS[c]) {
       case BSL: {
         const e = u[p + 1];
-        if (e === 34) {
-          u[h] = 38; u[h + 1] = 113; u[h + 2] = 117; u[h + 3] = 111; u[h + 4] = 116; u[h + 5] = 59;
-          h += 6;
-          p += 2;
-        } else if (e === 92) {
+        if (e === 110 || e === 114) {
+          p = lineBreak(u, p, b);
+          if (p < 0) return;
+          break;
+        }
+        if (e === 92) {
           // A backslash of the text: it escapes the character after it when that is one a backslash escapes.
           let done = false;
           if (p + 2 < b) {
@@ -1185,91 +1309,81 @@ function inl(a, b) {
           p += 2;
           if (wordAt(u, p)) words++;
         } else throw BAIL;
+        hp = h;
         break;
       }
       case TICK: {
-        let j = p + 1;
-        while (j < b && u[j] !== 96) j++;
-        if (j < b && j > p + 1) {
-          hp = lit(u, h, K_CODE);
+        const j = find(u, p + 1, b, 3, 96);
+        if (j > p + 1) {
+          hp = k_lit(u, h, K_CODE);
           escSpan(p + 1, j);
-          h = lit(u, hp, K_CODE_END);
+          hp = k_lit(u, hp, K_CODE_END);
           p = j + 1;
         } else {
-          u[h++] = 96;
+          u[h] = 96;
+          hp = h + 1;
           p++;
         }
         break;
       }
       case STAR: {
         if (p + 1 < b && u[p + 1] === 42) {
-          const j = findDouble(u, p + 2, b);
+          const j = find(u, p + 2, b, 2, 42);
           if (j > p + 2) {
-            hp = lit(u, h, K_STRONG);
+            hp = k_lit(u, h, K_STRONG);
             inl(p + 2, j);
-            h = lit(u, hp, K_STRONG_END);
+            hp = k_lit(u, hp, K_STRONG_END);
             p = j + 2;
           } else {
             u[h] = 42; u[h + 1] = 42;
-            h += 2;
+            hp = h + 2;
             p += 2;
           }
         } else {
-          const j = findSingle(u, p + 1, b);
+          const j = find(u, p + 1, b, 1, 42);
           if (j > p + 1) {
-            hp = lit(u, h, K_EM);
+            hp = k_lit(u, h, K_EM);
             inl(p + 1, j);
-            h = lit(u, hp, K_EM_END);
+            hp = k_lit(u, hp, K_EM_END);
             p = j + 1;
           } else {
-            u[h++] = 42;
+            u[h] = 42;
+            hp = h + 1;
             p++;
           }
         }
         break;
       }
       case LBR: {
-        const close = findClose(u, p + 1, b);
+        const close = find(u, p + 1, b, 0, 93);
         let m = -1;
-        if (close !== -1 && close + 1 < b && u[close + 1] === 40) {
-          m = close + 2;
-          while (m < b && u[m] !== 41) m++;
-          if (m >= b) m = -1;
-        }
-        if (m > close + 2 && noSpace(u, close + 2, m)) {
-          hp = lit(u, h, K_A);
+        if (close !== -1 && close + 1 < b && u[close + 1] === 40) m = find(u, close + 2, b, 3, 41);
+        if (m > close + 2 && (k_find(u, close + 2, m, 4, 0) < 0 || noSpace(u, close + 2, m))) {
+          hp = k_lit(u, h, K_A);
           href(close + 2, m);
           h = hp;
           u[h] = 92; u[h + 1] = 34; u[h + 2] = 62;
           hp = h + 3;
           inl(p + 1, close);
-          h = lit(u, hp, K_A_END);
+          hp = k_lit(u, hp, K_A_END);
           p = m + 1;
         } else {
-          u[h++] = 91;
+          u[h] = 91;
+          hp = h + 1;
           p++;
         }
         break;
       }
-      case NL:
-        u[h] = 92; u[h + 1] = 110;
-        h += 2;
-        p++;
-        words++;
-        break;
-      case FILL:
-        p++;
-        break;
       case UNI:
         if (uniWs(u, p)) throw BAIL;
-        u[h++] = c;
+        u[h] = c;
+        hp = h + 1;
         p++;
         break;
       default:
         throw BAIL;
     }
   }
-  hp = h;
 }
 
 // ---- lines
@@ -1385,7 +1499,7 @@ function endsParagraph(u, p, e) {
 }
 
 /** The slug of JSON string bytes at d: its length, or -1 when the text is not plain ASCII (read it as a string). */
-function slugBytes(u, a, b, d) {
+function k_slug(u, a, b, d) {
   let n = 0;
   let gap = false;
   for (let p = a; p < b; p++) {
@@ -1410,7 +1524,11 @@ function slugBytes(u, a, b, d) {
     if (n === 64) break;
   }
   if (n > 0 && u[d + n - 1] === 45) n--;
-  if (n === 0) return lit(u, d, K_UNTITLED) - d;
+  if (n === 0) {
+    // "untitled"
+    u[d] = 117; u[d + 1] = 110; u[d + 2] = 116; u[d + 3] = 105; u[d + 4] = 116; u[d + 5] = 108; u[d + 6] = 101; u[d + 7] = 100;
+    return 8;
+  }
   return n;
 }
 
@@ -1424,8 +1542,8 @@ function heading(d, a, b) {
   words += 2;
   let h = hp;
   u[h] = 60; u[h + 1] = 104; u[h + 2] = 48 + d;
-  h = lit(u, h + 3, K_ID);
-  let n = slugBytes(u, a, b, h);
+  h = k_lit(u, h + 3, K_ID);
+  let n = k_slug(u, a, b, h);
   if (n < 0) n = BUF.latin1Write(slugify(str(a, b)), h);
   // The first of slug, slug-2, slug-3 … that is no id of this page yet.
   const base = n;
@@ -1484,9 +1602,33 @@ function markdown(f) {
   words = 0;
   curF = f;
   curDir = F[f + DE];
+  curCE = ce;
   brAt = brN;
   let p = F[f + BS];
   while (p <= ce) {
+    const c = u[p];
+    if (c === 92 && u[p + 1] === 110) {
+      p += 2; // an empty line
+      continue;
+    }
+    if (START[c] === 0 && c !== 62 && (c < 48 || c > 57)) {
+      // Nothing a block opens on: a paragraph, read in one pass to the line break that ends it.
+      words++;
+      hp = k_lit(u, hp, K_P);
+      const hs = hp;
+      pEnd = -1;
+      inl(p, ce);
+      if (pEnd < 0) {
+        hp = untrail(u, hp);
+        p = ce + 1;
+      } else p = pEnd;
+      if (xl < 0) {
+        xo = hs;
+        xl = hp - hs;
+      }
+      hp = k_lit(u, hp, K_P_END);
+      continue;
+    }
     eol(u, p, ce);
     let e = le;
     let n = ln;
@@ -1494,7 +1636,6 @@ function markdown(f) {
       p = n;
       continue;
     }
-    const c = u[p];
     if ((c === 32 || c === 92) && isBlank(u, p, e)) {
       p = n;
       continue;
@@ -1503,9 +1644,9 @@ function markdown(f) {
       const lang = fenceOpen(u, p, e);
       if (lang >= 0) {
         words++;
-        let h = lit(u, hp, K_PRE);
+        let h = k_lit(u, hp, K_PRE);
         if (lang > p + 3) {
-          h = lit(u, h, K_LANG);
+          h = k_lit(u, h, K_LANG);
           for (let q = p + 3; q < lang; q++) u[h++] = u[q];
           u[h] = 92; u[h + 1] = 34;
           h += 2;
@@ -1528,7 +1669,7 @@ function markdown(f) {
           hp += 2;
           p = n;
         }
-        hp = lit(u, hp, K_PRE_END);
+        hp = k_lit(u, hp, K_PRE_END);
         continue;
       }
     }
@@ -1542,12 +1683,12 @@ function markdown(f) {
     }
     if ((c === 45 || c === 42) && isHr(u, p, e, c)) {
       words++;
-      hp = lit(u, hp, K_HR);
+      hp = k_lit(u, hp, K_HR);
       p = n;
       continue;
     }
     if (c === 62) {
-      hp = lit(u, hp, K_BQ);
+      hp = k_lit(u, hp, K_BQ);
       let us = 0;
       let ue = -1;
       for (;;) {
@@ -1571,11 +1712,11 @@ function markdown(f) {
         n = ln;
       }
       if (ue >= 0) {
-        hp = lit(u, hp, K_P);
+        hp = k_lit(u, hp, K_P);
         inl(us, ue);
-        hp = lit(u, hp, K_P_END);
+        hp = k_lit(u, hp, K_P_END);
       }
-      hp = lit(u, hp, K_BQ_END);
+      hp = k_lit(u, hp, K_BQ_END);
       continue;
     }
     let a = -1; // where the first item's text starts, when the line opens a list
@@ -1589,16 +1730,16 @@ function markdown(f) {
         a = q + 2;
         let start = 0;
         for (let k = p; k < q; k++) start = start * 10 + (u[k] - 48);
-        if (start === 1) hp = lit(u, hp, K_OL);
+        if (start === 1) hp = k_lit(u, hp, K_OL);
         else {
-          hp = lit(u, hp, K_OL_START);
+          hp = k_lit(u, hp, K_OL_START);
           hp = wnum(u, hp, start);
-          hp = lit(u, hp, K_QUOTE_GT_NL);
+          hp = k_lit(u, hp, K_QUOTE_GT_NL);
         }
       }
     }
     if (a >= 0) {
-      if (!ordered) hp = lit(u, hp, K_UL);
+      if (!ordered) hp = k_lit(u, hp, K_UL);
       for (;;) {
         // An item: its mark, its text on this line and the lines that continue it.
         words++;
@@ -1636,37 +1777,29 @@ function markdown(f) {
           ue = trimEnd(u, q, e);
           p = n;
         }
-        hp = lit(u, hp, K_LI);
+        hp = k_lit(u, hp, K_LI);
         inl(us, ue);
-        hp = lit(u, hp, K_LI_END);
+        hp = k_lit(u, hp, K_LI_END);
         if (!more) break;
       }
-      hp = lit(u, hp, ordered ? K_OL_END : K_UL_END);
+      hp = k_lit(u, hp, ordered ? K_OL_END : K_UL_END);
       continue;
     }
-    // A paragraph: this line and those after it, up to a blank line, a fence, a heading or a break.
-    const us = skipWs(u, p, e);
-    let ue = trimEnd(u, us, e);
+    // A paragraph after all (a line that looked like a block's and is none): the same one pass.
     words++;
-    p = n;
-    while (p <= ce) {
-      eol(u, p, ce);
-      e = le;
-      n = ln;
-      if (endsParagraph(u, p, e)) break;
-      const a2 = skipWs(u, p, e);
-      fill(u, ue, a2);
-      ue = trimEnd(u, a2, e);
-      p = n;
-    }
-    hp = lit(u, hp, K_P);
+    hp = k_lit(u, hp, K_P);
     const hs = hp;
-    inl(us, ue);
+    pEnd = -1;
+    inl(skipWs(u, p, e), ce);
+    if (pEnd < 0) {
+      hp = untrail(u, hp);
+      p = ce + 1;
+    } else p = pEnd;
     if (xl < 0) {
       xo = hs;
       xl = hp - hs;
     }
-    hp = lit(u, hp, K_P_END);
+    hp = k_lit(u, hp, K_P_END);
   }
   F[f + HO] = h0;
   F[f + HL] = hp - h0;
@@ -1680,74 +1813,161 @@ function markdown(f) {
   if (DEBUG) globalThis.__mfWords?.push(words);
 }
 
+// ---- the kernels made ready
+
+// V8's own switches for when a function is optimized, where the driver allowed their syntax (--allow-natives-syntax);
+// null where it did not, and the kernels are then optimized when V8 finds them hot.
+let prepare = null;
+let optimizeNext = null;
+try {
+  prepare = new Function('f', '%PrepareFunctionForOptimization(f)');
+  optimizeNext = new Function('f', '%OptimizeFunctionOnNextCall(f)');
+} catch {
+  prepare = optimizeNext = null;
+}
+
+const PRIME_TEXT = 'ab c \\"d \\"e  f \\tg !h &<>\'i\\\\j\nk\x01l`m*n[o \\\\*p**q*r]s(t)u\\\\\\\\v w\\\\\\"x y\\nz \\nq\\n r\\n\\ns\\r\\nt\\t\\nu ';
+const PRIME = bytes(PRIME_TEXT);
+const PRIME_STAR = PRIME_TEXT.indexOf('n[o'); // past the first star
+let primed = false;
+
+/**
+ * Runs every kernel over every branch it has, on a made-up sample, then asks for each to be optimized: the compiler
+ * then sees all of a kernel at once and compiles it once, before the first case is read.
+ */
+function prime() {
+  if (primed) return;
+  primed = true;
+  const u = B;
+  const a = HT0;
+  const b = a + PRIME.length;
+  const o = a + 4096;
+  u.set(PRIME, a);
+  const ht = new Int32Array(8);
+  const rows = new Int32Array(8);
+  rows[0] = a; // one path: the sample's first three bytes
+  rows[1] = a + 3;
+  rows[2] = a + 5; // another, of the same length
+  rows[3] = a + 8;
+  const kernels = [k_scan, k_cpy, k_lit, k_find, k_lookup, k_slug];
+  if (prepare !== null) for (const k of kernels) prepare(k);
+  const all = () => {
+    for (const t of [TI, TE, TA]) {
+      for (let p = a; p < b; ) {
+        p = k_scan(u, p, b, o, t);
+        if (p < b) p += u[p] === 92 ? 2 : 1;
+      }
+    }
+    for (let kind = 0; kind <= 3; kind++) {
+      k_find(u, a, b, kind, 42);
+      k_find(u, a, b, kind, 93);
+      k_find(u, a + PRIME_STAR, b, kind, 42);
+      k_find(u, a + PRIME_STAR, b, kind, 93);
+      k_find(u, a, a + 9, kind, 42);
+    }
+    for (let kind = 4; kind <= 7; kind++) {
+      k_find(u, a, b, kind, 0);
+      k_find(u, a, a + 2, kind, 0);
+    }
+    k_slug(u, a, b, o);
+    k_slug(u, a + 1, a + 2, o);
+    k_slug(u, a + 2, a + 3, o);
+    k_slug(u, b - 3, b, o);
+    k_cpy(u, o, a, 0);
+    k_cpy(u, o, a, 7);
+    k_cpy(u, o, a, 200);
+    k_lit(u, o, K_P);
+    k_lit(u, o, K_PRE_END);
+    ht.fill(0);
+    for (let g = 0; g < 4; g += 2) if (k_lookup(u, rows[g], 3, ht, 7, rows) < 0) ht[slot] = g + 1;
+    for (let n = 1; n <= 4; n++) for (let from = a; from < a + 8; from++) k_lookup(u, from, n, ht, 7, rows);
+  };
+  all();
+  all();
+  if (optimizeNext !== null) {
+    for (const k of kernels) optimizeNext(k);
+    all();
+  }
+  hp = 0;
+  words = 0;
+}
+
 // ---- the files of a case: one row each
 
-const FS = 48;
+const FS = 64;
 const PS = 0; // path
 const PE = 1;
 const CE = 3; // content end
 const ST = 4; // 0 a page that is built, 1 refused, 2 a draft, 3 a static file
 const POST = 5;
-const TEO = 6; // title, escaped
+const TEO = 6; // title, escaped: where and how long, as every string here
 const TEL = 7;
 const TRO = 8; // title, as it is
 const TRL = 9;
 const DATE = 10; // yyyymmdd, 0 with none
-const DO = 11;
-const DLO = 12; // the date in words
-const DLL = 13;
-const SEO = 14; // summary, escaped
-const SEL = 15;
-const SRO = 16;
-const SRL = 17;
-const SLO = 18; // slug
-const SLL = 19;
-const UEO = 20; // url, escaped
-const UEL = 21;
-const URO = 22;
-const URL_ = 23;
-const KO = 24; // the output directory
-const KL = 25;
-const LAY = 26;
-const BS = 27; // body start
-const HO = 28; // html
-const HL = 29;
-const XO = 30; // excerpt
-const XL = 31;
-const TOC0 = 32;
-const TOCN = 33;
-const RM = 34; // reading minutes, 0 until the body is rendered
-const TG0 = 35; // its tags
-const TGN = 36;
-const NEWER = 37;
-const OLDER = 38;
-const BR0 = 39; // its broken links
-const BRN = 40;
-const TN0 = 41; // its tag names as written
-const TNN = 42;
-const SKO = 43; // the slug its front matter gives
-const SKL = 44;
-const LYO = 45; // the layout its front matter gives
-const LYL = 46;
-const DE = 47; // where its directory ends in its path
+const DO = 11; // the date as written
+const DN = 12;
+const DLO = 13; // the date in words
+const DLL = 14;
+const SEO = 15; // summary, escaped
+const SEL = 16;
+const SRO = 17;
+const SRL = 18;
+const SLO = 19; // slug
+const SLL = 20;
+const UEO = 21; // url, escaped
+const UEL = 22;
+const URO = 23;
+const URL_ = 24;
+const KO = 25; // the output directory
+const KL = 26;
+const LAY = 27;
+const BS = 28; // body start
+const HO = 29; // html
+const HL = 30;
+const XO = 31; // excerpt
+const XL = 32;
+const TOC0 = 33;
+const TOCN = 34;
+const RM = 35; // reading minutes, 0 until the body is rendered
+const TG0 = 36; // its tags
+const TGN = 37;
+const NEWER = 38;
+const OLDER = 39;
+const BR0 = 40; // its broken links
+const BRN = 41;
+const TN0 = 42; // its tag names as written
+const TNN = 43;
+const SKO = 44; // the slug its front matter gives
+const SKL = 45;
+const LYO = 46; // the layout its front matter gives
+const LYL = 47;
+const DE = 48; // where its directory ends in its path
 let F = new Int32Array(FS * 1024);
 
-let TN = new Int32Array(8192); // tag names as written: where and how long
+let TN = new Int32Array(8192); // every source's tags as written: spellings (see nameOf)
 let tnN = 0;
 
-function tnPush(a, n) {
-  if (tnN + 2 > TN.length) {
-    const g = new Int32Array(TN.length * 2);
-    g.set(TN);
-    TN = g;
+function tnPush(g) {
+  if (tnN === TN.length) {
+    const grown = new Int32Array(TN.length * 2);
+    grown.set(TN);
+    TN = grown;
   }
-  TN[tnN++] = a;
-  TN[tnN++] = n;
+  TN[tnN++] = g;
 }
 
 /** Stops the byte path before kept bytes run out of room. */
 function room(n) {
   if (sp + n > SCR1) throw BAIL;
+}
+
+/** The answer written so far goes to the file; a file that outgrew the store ends the byte path. */
+function flush() {
+  if (op > OUT1) throw BAIL;
+  if (outFd < 0) outFd = openSync(outFile, 'w');
+  for (let a = OUT0; a < op; ) a += writeSync(outFd, BUF, a, op - a);
+  op = OUT0;
 }
 
 // ---- front matter
@@ -1790,37 +2010,32 @@ function fmStringSlow(f, id, vs, ve) {
 
 function fmString(f, id, vs, ve) {
   const u = B;
-  let escapes = false;
-  let special = false;
-  for (let q = vs; q < ve; q++) {
-    const c = u[q];
-    if (c === 92) escapes = true;
-    else if (c === 38 || c === 60 || c === 62 || c === 39) special = true;
-  }
   let a = vs;
   let b = ve;
-  if (escapes) {
-    // A quoted string with no escape inside is its inside; any other is read as the string it is.
-    let simple = ve - vs >= 4 && u[vs] === 92 && u[vs + 1] === 34 && u[ve - 2] === 92 && u[ve - 1] === 34;
-    if (simple) {
-      for (let q = vs + 2; q < ve - 2; q++) {
-        if (u[q] === 92) {
-          simple = false;
-          break;
-        }
-      }
-    }
-    if (!simple) return fmStringSlow(f, id, vs, ve);
-    a = vs + 2;
-    b = ve - 2;
-  } else if (u[vs] === 91) return 'a bare string opens on [';
-  let eo = a;
-  let el = b - a;
-  if (special) {
-    room(6 * el);
+  let eo = vs;
+  let el = ve - vs;
+  if (k_find(u, vs, ve, 6, 0) < 0) {
+    // nothing to escape and no escape: the bytes as they stand
+    if (u[vs] === 91) return 'a bare string opens on [';
+  } else {
+    if (u[vs] === 92 && u[vs + 1] === 34) {
+      // Quoted: its inside when no escape is in it; any other is read as the string it is.
+      let simple = ve - vs >= 4 && u[ve - 2] === 92 && u[ve - 1] === 34;
+      for (let q = vs + 2; simple && q < ve - 2; q++) if (u[q] === 92) simple = false;
+      if (!simple) return fmStringSlow(f, id, vs, ve);
+      a = vs + 2;
+      b = ve - 2;
+    } else if (u[vs] === 91) return 'a bare string opens on [';
+    // (A bare string is its bytes as they stand, escapes and all.)
+    room(6 * (b - a) + 64);
     eo = sp;
     sp = escTo(u, sp, a, b);
     el = sp - eo;
+    if (el === b - a) {
+      // nothing was escaped
+      sp = eo;
+      eo = a;
+    }
   }
   const g = f + (id === 0 ? TEO : SEO);
   F[g] = eo;
@@ -1830,12 +2045,45 @@ function fmString(f, id, vs, ve) {
   return null;
 }
 
+let NM = new Int32Array(512); // every spelling of a tag in the case: where it starts and ends
+let nmN = 0;
+let NH = new Int32Array(1024); // the spellings by their bytes
+let nhMask = 1023;
+
+/** The spelling at [x, y): the same number for the same bytes. */
+function nameOf(u, x, y) {
+  let g = k_lookup(u, x, y - x, NH, nhMask, NM);
+  if (g >= 0) return g;
+  if (nmN + 2 > NM.length) {
+    const grown = new Int32Array(NM.length * 2);
+    grown.set(NM);
+    NM = grown;
+  }
+  if (nmN >= NH.length >> 1) {
+    // too full to probe well: twice the room, every spelling put again
+    NH = new Int32Array(NH.length * 2);
+    nhMask = NH.length - 1;
+    for (let k = 0; k < nmN; k += 2) {
+      k_lookup(u, NM[k], NM[k + 1] - NM[k], NH, nhMask, NM);
+      NH[slot] = k + 1;
+    }
+    k_lookup(u, x, y - x, NH, nhMask, NM);
+  }
+  g = nmN;
+  NM[g] = x;
+  NM[g + 1] = y;
+  NH[slot] = g + 1;
+  nmN += 2;
+  return g;
+}
+
 function fmTags(f, a, b) {
   const u = B;
   const t0 = tnN;
-  for (let q = a; q < b; q++) {
-    const c = u[q];
-    if (c === 92 || (CLS[c] === UNI && uniWs(u, q))) {
+  for (let x = k_find(u, a, b, 7, 0); x >= 0; x = k_find(u, x + 1, b, 7, 0)) {
+    const c = u[x];
+    if (c === 91 || c === 93) return false;
+    if (c === 92 || uniWs(u, x)) {
       // Tabs, backslashes or spaces outside ASCII: read as the strings they are.
       const tags = tagsOf(str(a - 1, b + 1));
       if (tags === null) return false;
@@ -1843,11 +2091,11 @@ function fmTags(f, a, b) {
         const j = jsonText(t);
         room(3 * j.length);
         const n = BUF.write(j, sp);
-        tnPush(sp, n);
+        tnPush(nameOf(u, sp, sp + n));
         sp += n;
       }
       F[f + TN0] = t0;
-      F[f + TNN] = (tnN - t0) >> 1;
+      F[f + TNN] = tnN - t0;
       return true;
     }
   }
@@ -1856,21 +2104,23 @@ function fmTags(f, a, b) {
   if (q < b) {
     let s = a;
     for (;;) {
-      let e = s;
-      while (e < b && u[e] !== 44) e++;
+      let e = k_find(u, s, b, 3, 44);
+      if (e < 0) e = b;
       let x = s;
       let y = e;
       while (x < y && u[x] === 32) x++;
       while (y > x && u[y - 1] === 32) y--;
-      if (x === y) return false;
-      for (let k = x; k < y; k++) if (u[k] === 91 || u[k] === 93) return false;
-      tnPush(x, y - x);
+      if (x === y) {
+        tnN = t0;
+        return false;
+      }
+      tnPush(nameOf(u, x, y));
       if (e >= b) break;
       s = e + 1;
     }
   }
   F[f + TN0] = t0;
-  F[f + TNN] = (tnN - t0) >> 1;
+  F[f + TNN] = tnN - t0;
   return true;
 }
 
@@ -1886,6 +2136,7 @@ function fmDate(f, vs, ve) {
   if (y < 1970 || y > 2099 || m < 1 || m > 12 || d < 1 || d > daysIn(y, m)) return false;
   F[f + DATE] = y * 10000 + m * 100 + d;
   F[f + DO] = vs;
+  F[f + DN] = 10;
   return true;
 }
 
@@ -1997,35 +2248,47 @@ let BASE_EL = 0;
 let BASE_RO = 0;
 let BASE_RL = 0;
 
-function hashOf(u, a, n) {
-  let h = -2128831035;
-  for (let k = 0; k < n; k++) h = Math.imul(h ^ u[a + k], 16777619);
-  return h;
-}
+let slot = 0; // where k_lookup stopped when it found nothing: the place to put what it looked for
 
-/** The row of the built page or static file at a path, or -1. */
-function find(u, a, n) {
-  let k = hashOf(u, a, n) & hMask;
+/** The row of the built page or static file whose path is the n bytes at a, or -1 (slot is then where it would go). */
+function k_lookup(u, a, n, ht, mask, f) {
+  let h = 0;
+  for (let k = 0; k < n; k++) h = (Math.imul(h, 31) + u[a + k]) | 0;
+  let k = h & mask;
   for (;;) {
-    const v = HT[k];
-    if (v === 0) return -1;
+    const v = ht[k];
+    if (v === 0) {
+      slot = k;
+      return -1;
+    }
     const g = v - 1;
-    if (F[g + PE] - F[g + PS] === n && same(u, F[g + PS], a, n)) return g;
-    k = (k + 1) & hMask;
+    const ps = f[g];
+    if (f[g + 1] - ps === n) {
+      let i = 0;
+      while (i < n && u[ps + i] === u[a + i]) i++;
+      if (i === n) return g;
+    }
+    k = (k + 1) & mask;
   }
 }
 
 function hashPut(u, g) {
-  let k = hashOf(u, F[g + PS], F[g + PE] - F[g + PS]) & hMask;
-  while (HT[k] !== 0) k = (k + 1) & hMask;
-  HT[k] = g + 1;
+  if (k_lookup(u, F[g + PS], F[g + PE] - F[g + PS], HT, hMask, F) >= 0) throw BAIL;
+  HT[slot] = g + 1;
 }
 
 // ---- templates, compiled for one site: what every page shares is rendered once, into kept bytes
 
 const OP_END = 0;
 const OP_STATIC = 1; // kept bytes: where, how long
-const OP_STR = 2; // a string of the page: which, whose, how (0 as it is, 1 escaped, 2 escaped as it is written)
+const OP_STR = 2; // a string of an index page's pager: which, whose, how (0 as it is, 1 escaped)
+const OP_F = 10; // a string of a page or a card: its place in the row, the register of the row
+const OP_FH = 11; // the same of a page's newer or older post: place, register, which
+const OP_T = 12; // a string of a tag
+const OP_C = 13; // a string of a table of contents row
+const OP_ESC = 14; // HTML of a page, escaped as it is written: 0 a row's, 1 a table of contents row's; place, register
+const OP_IFF = 15; // a string of a page tested: place, register, whether "not", where to go when it fails
+const OP_IFT = 16; // a string of a tag tested
 const OP_NUM = 3;
 const OP_BOOL = 4;
 const OP_SEP = 5; // an array written: its items are objects, so only what joins them
@@ -2219,6 +2482,23 @@ function look(scope, path) {
   return c;
 }
 
+/** Where a string sits in its row: a page's or a card's in F, a tag's in TG. */
+function placeOf(field, esc) {
+  switch (field) {
+    case S_TITLE: return esc ? TEO : TRO;
+    case S_URL: return esc ? UEO : URO;
+    case S_DATE: return DO;
+    case S_DATELONG: return DLO;
+    case S_SUMMARY: return esc ? SEO : SRO;
+    case S_EXCERPT: return XO;
+    case S_SLUG: return SLO;
+    case S_CONTENT: return HO;
+    case S_TAGNAME: return esc ? NEO : NRO;
+    case S_TAGSLUG: return TSO;
+    default: return esc ? TUO : TVO;
+  }
+}
+
 /** Text every page of the site shares, kept once. */
 function keep(j) {
   if (j.length === 0) return;
@@ -2248,10 +2528,21 @@ function compileNodes(nodes, scope, depth) {
             keep(jsonText(esc ? escapeHtml(t) : t));
             break;
           }
-          case V_STR:
-            CODE.push(OP_STR, c.a, c.b, !esc ? 0 : c.a === S_EXCERPT || c.a === S_CONTENT || c.a === S_TOCHTML ? 2 : 1);
+          case V_STR: {
+            const field = c.a;
+            const reg = c.b & 255;
+            const hop = c.b >> 8;
+            if (field >= S_PURL) CODE.push(OP_STR, field, 0, esc ? 1 : 0);
+            else if (esc && (field === S_EXCERPT || field === S_CONTENT)) CODE.push(OP_ESC, 0, placeOf(field, false), reg);
+            else if (esc && field === S_TOCHTML) CODE.push(OP_ESC, 1, 3, reg);
+            else if (field <= S_CONTENT) {
+              if (hop === 0) CODE.push(OP_F, placeOf(field, esc), reg);
+              else CODE.push(OP_FH, placeOf(field, esc), reg, hop);
+            } else if (field <= S_TAGURL) CODE.push(OP_T, placeOf(field, esc), reg);
+            else CODE.push(OP_C, field === S_TOCID ? 1 : 3, reg);
             lastStatic = -1;
             break;
+          }
           case V_NUM:
             CODE.push(OP_NUM, c.a, c.b);
             lastStatic = -1;
@@ -2287,7 +2578,9 @@ function compileNodes(nodes, scope, depth) {
           break;
         }
         const at = CODE.length;
-        CODE.push(OP_IF, kind, c.a, c.b, n.not ? 1 : 0, 0);
+        if (kind === 0 && c.a <= S_CONTENT && c.b >> 8 === 0) CODE.push(OP_IFF, placeOf(c.a, false), c.b, 0, n.not ? 1 : 0, 0);
+        else if (kind === 0 && c.a >= S_TAGNAME && c.a <= S_TAGURL) CODE.push(OP_IFT, placeOf(c.a, false), c.b, 0, n.not ? 1 : 0, 0);
+        else CODE.push(OP_IF, kind, c.a, c.b, n.not ? 1 : 0, 0);
         lastStatic = -1;
         compileNodes(n.a, scope, depth);
         if (n.b !== null) {
@@ -2353,102 +2646,19 @@ function compile(name, kind) {
   return start;
 }
 
-let SO = 0; // the string span() found
-let SL = 0;
-
-function span(field, sel, esc) {
+/** How long a string of a page is (through a newer or older post where sel says so), a tag's or a contents row's. */
+function lengthOf(field, sel) {
   if (field <= S_CONTENT) {
     let f = R[sel & 255];
     const hop = sel >> 8;
     if (hop !== 0) {
       f = F[f + (hop === 1 ? NEWER : OLDER)];
-      if (f < 0) {
-        SL = 0;
-        return;
-      }
+      if (f < 0) return 0;
     }
-    switch (field) {
-      case S_TITLE:
-        if (esc !== 0) {
-          SO = F[f + TEO];
-          SL = F[f + TEL];
-        } else {
-          SO = F[f + TRO];
-          SL = F[f + TRL];
-        }
-        return;
-      case S_URL:
-        if (esc !== 0) {
-          SO = F[f + UEO];
-          SL = F[f + UEL];
-        } else {
-          SO = F[f + URO];
-          SL = F[f + URL_];
-        }
-        return;
-      case S_DATE:
-        SO = F[f + DO];
-        SL = F[f + DATE] !== 0 ? 10 : 0;
-        return;
-      case S_DATELONG:
-        SO = F[f + DLO];
-        SL = F[f + DLL];
-        return;
-      case S_SUMMARY:
-        if (esc !== 0) {
-          SO = F[f + SEO];
-          SL = F[f + SEL];
-        } else {
-          SO = F[f + SRO];
-          SL = F[f + SRL];
-        }
-        return;
-      case S_EXCERPT:
-        SO = F[f + XO];
-        SL = F[f + XL];
-        return;
-      case S_SLUG:
-        SO = F[f + SLO];
-        SL = F[f + SLL];
-        return;
-      default:
-        SO = F[f + HO];
-        SL = F[f + HL];
-        return;
-    }
+    return F[f + placeOf(field, false) + 1];
   }
-  const t = R[sel];
-  switch (field) {
-    case S_TAGNAME:
-      if (esc !== 0) {
-        SO = TG[t + NEO];
-        SL = TG[t + NEL];
-      } else {
-        SO = TG[t + NRO];
-        SL = TG[t + NRL];
-      }
-      return;
-    case S_TAGSLUG:
-      SO = TG[t + TSO];
-      SL = TG[t + TSL];
-      return;
-    case S_TAGURL:
-      if (esc !== 0) {
-        SO = TG[t + TUO];
-        SL = TG[t + TUL];
-      } else {
-        SO = TG[t + TVO];
-        SL = TG[t + TVL];
-      }
-      return;
-    case S_TOCID:
-      SO = TC[t + 1];
-      SL = TC[t + 2];
-      return;
-    default:
-      SO = TC[t + 3];
-      SL = TC[t + 4];
-  }
+  if (field <= S_TAGURL) return TG[R[sel] + placeOf(field, false) + 1];
+  return TC[R[sel] + (field === S_TOCID ? 2 : 4)];
 }
 
 function arrLen(kind, sel) {
@@ -2477,8 +2687,7 @@ function test(kind, a, b) {
   switch (kind) {
     case 0:
       if (a >= S_PURL) return a === S_PURL || (a === S_PNEWER ? pgN > 1 : pgN < pgT);
-      span(a, b, 0);
-      return SL > 0;
+      return lengthOf(a, b) > 0;
     case 1: return num(a, b) !== 0;
     case 2: return a === B_ISPOST ? F[R[b] + POST] === 1 : a === B_LFIRST ? LI[b] === 1 : LI[b] === LN[b];
     case 3: return arrLen(a, b) > 0;
@@ -2488,10 +2697,10 @@ function test(kind, a, b) {
 
 /** An index page's url at h (page 1 is the site's root). */
 function pageUrl(u, h, k, esc) {
-  h = esc !== 0 ? cpy(u, h, BASE_EO, BASE_EL) : cpy(u, h, BASE_RO, BASE_RL);
+  h = esc !== 0 ? k_cpy(u, h, BASE_EO, BASE_EL) : k_cpy(u, h, BASE_RO, BASE_RL);
   u[h++] = 47;
   if (k === 1) return h;
-  h = wnum(u, lit(u, h, K_PAGE_DIR), k);
+  h = wnum(u, k_lit(u, h, K_PAGE_DIR), k);
   u[h] = 47;
   return h + 1;
 }
@@ -2504,19 +2713,53 @@ function exec(pc) {
   for (;;) {
     switch (C[pc]) {
       case OP_STATIC:
-        o = cpy(u, o, C[pc + 1], C[pc + 2]);
+        o = k_cpy(u, o, C[pc + 1], C[pc + 2]);
         pc += 3;
         break;
+      case OP_F: {
+        const g = R[C[pc + 2]] + C[pc + 1];
+        o = k_cpy(u, o, F[g], F[g + 1]);
+        pc += 3;
+        break;
+      }
+      case OP_T: {
+        const g = R[C[pc + 2]] + C[pc + 1];
+        o = k_cpy(u, o, TG[g], TG[g + 1]);
+        pc += 3;
+        break;
+      }
+      case OP_C: {
+        const g = R[C[pc + 2]] + C[pc + 1];
+        o = k_cpy(u, o, TC[g], TC[g + 1]);
+        pc += 3;
+        break;
+      }
+      case OP_IFF: {
+        if ((F[R[C[pc + 2]] + C[pc + 1] + 1] > 0) !== (C[pc + 4] === 1)) pc += 6;
+        else pc = C[pc + 5];
+        break;
+      }
+      case OP_IFT: {
+        if ((TG[R[C[pc + 2]] + C[pc + 1] + 1] > 0) !== (C[pc + 4] === 1)) pc += 6;
+        else pc = C[pc + 5];
+        break;
+      }
+      case OP_FH: {
+        const f = F[R[C[pc + 2]] + (C[pc + 3] === 1 ? NEWER : OLDER)];
+        if (f >= 0) o = k_cpy(u, o, F[f + C[pc + 1]], F[f + C[pc + 1] + 1]);
+        pc += 4;
+        break;
+      }
+      case OP_ESC: {
+        const g = R[C[pc + 3]] + C[pc + 2];
+        o = C[pc + 1] === 0 ? escTo(u, o, F[g], F[g] + F[g + 1]) : escTo(u, o, TC[g], TC[g] + TC[g + 1]);
+        pc += 4;
+        break;
+      }
       case OP_STR: {
         const field = C[pc + 1];
-        const esc = C[pc + 3];
-        if (field >= S_PURL) {
-          const k = field === S_PURL ? pgN : field === S_PNEWER ? (pgN > 1 ? pgN - 1 : 0) : pgN < pgT ? pgN + 1 : 0;
-          if (k !== 0) o = pageUrl(u, o, k, esc);
-        } else {
-          span(field, C[pc + 2], esc);
-          o = esc === 2 ? escTo(u, o, SO, SO + SL) : cpy(u, o, SO, SL);
-        }
+        const k = field === S_PURL ? pgN : field === S_PNEWER ? (pgN > 1 ? pgN - 1 : 0) : pgN < pgT ? pgN + 1 : 0;
+        if (k !== 0) o = pageUrl(u, o, k, C[pc + 3]);
         pc += 4;
         break;
       }
@@ -2525,7 +2768,7 @@ function exec(pc) {
         pc += 3;
         break;
       case OP_BOOL:
-        o = lit(u, o, test(2, C[pc + 1], C[pc + 2]) ? K_TRUE : K_FALSE);
+        o = k_lit(u, o, test(2, C[pc + 1], C[pc + 2]) ? K_TRUE : K_FALSE);
         pc += 3;
         break;
       case OP_SEP:
@@ -2594,36 +2837,52 @@ const K_REPORT_NAME = bytes('build-report.txt');
 const K_TAGS_SLASH = bytes('tags/');
 const K_PAGE_SLASH = bytes('page/');
 
-/** The lists a post's tags are read into: every spelling's slug, every slug's tag. */
+/** The tags of the case: every spelling's slug, every slug's tag, each source's tags and each tag's posts. */
 function tagPhase(u, kept, nKept, posts, nPosts, base) {
-  const slugOfName = new Map();
-  const tagOfSlug = new Map();
+  const slugOfName = new Int32Array(nmN >> 1).fill(-1); // each spelling's slug, as a number
+  const slugNumber = new Map();
+  const slugs = [];
+  const tagOfSlug = []; // each slug's tag, -1 while no post has it
   const names = []; // each tag's name, slug and url, as templates read them
+  const seen = [];
   let nTags = 0;
   let trN = 0;
-  const seen = [];
   const refs = (f, post) => {
     const t0 = F[f + TN0];
     const n = F[f + TNN];
     const start = trN;
-    seen.length = 0;
+    let nSeen = 0;
     for (let k = 0; k < n; k++) {
-      const a = TN[t0 + 2 * k];
-      const len = TN[t0 + 2 * k + 1];
-      const name = str(a, a + len);
-      let slug = slugOfName.get(name);
-      if (slug === undefined) slugOfName.set(name, (slug = slugify(name)));
-      if (seen.includes(slug)) continue;
-      seen.push(slug);
-      let t = tagOfSlug.get(slug);
-      if (t === undefined || (!post && t < 0)) {
-        if (!post && t === undefined) tagOfSlug.set(slug, -1); // no post has it: each page that names it has a tag of its own
-        // A new tag: named as it is first met.
+      const g = TN[t0 + k];
+      let id = slugOfName[g >> 1];
+      if (id < 0) {
+        const slug = slugify(str(NM[g], NM[g + 1]));
+        const known = slugNumber.get(slug);
+        if (known === undefined) {
+          id = slugs.length;
+          slugNumber.set(slug, id);
+          slugs.push(slug);
+          tagOfSlug.push(-1);
+        } else id = known;
+        slugOfName[g >> 1] = id;
+      }
+      // each slug once in a source, its first spelling kept
+      let again = false;
+      for (let j = 0; j < nSeen; j++) if (seen[j] === id) again = true;
+      if (again) continue;
+      seen[nSeen++] = id;
+      let t = tagOfSlug[id];
+      if (t < 0) {
+        // A new tag, named as it is first met: a post's is its slug's from here on; a page's, where no post has
+        // the slug, is its own and has no url.
         if ((nTags + 1) * TS > TG.length) {
-          const g = new Int32Array(TG.length * 2);
-          g.set(TG);
-          TG = g;
+          const grown = new Int32Array(TG.length * 2);
+          grown.set(TG);
+          TG = grown;
         }
+        const a = NM[g];
+        const len = NM[g + 1] - a;
+        const slug = slugs[id];
         t = nTags++ * TS;
         room(8 * len + 3 * BASE_EL + 256);
         TG[t + NRO] = a;
@@ -2636,24 +2895,24 @@ function tagPhase(u, kept, nKept, posts, nPosts, base) {
         TG[t + TSL] = sp - TG[t + TSO];
         TG[t + TPN] = 0;
         if (post) {
-          tagOfSlug.set(slug, t);
+          tagOfSlug[id] = t;
           TG[t + TUO] = sp;
-          sp = lit(u, cpy(u, sp, BASE_EO, BASE_EL), K_TAGS_DIR);
-          sp = cpy(u, sp, TG[t + TSO], TG[t + TSL]);
+          sp = k_lit(u, k_cpy(u, sp, BASE_EO, BASE_EL), K_TAGS_DIR);
+          sp = k_cpy(u, sp, TG[t + TSO], TG[t + TSL]);
           u[sp++] = 47;
           TG[t + TUL] = sp - TG[t + TUO];
           TG[t + TVO] = sp;
-          sp = lit(u, cpy(u, sp, BASE_RO, BASE_RL), K_TAGS_DIR);
-          sp = cpy(u, sp, TG[t + TSO], TG[t + TSL]);
+          sp = k_lit(u, k_cpy(u, sp, BASE_RO, BASE_RL), K_TAGS_DIR);
+          sp = k_cpy(u, sp, TG[t + TSO], TG[t + TSL]);
           u[sp++] = 47;
           TG[t + TVL] = sp - TG[t + TVO];
         } else TG[t + TUL] = TG[t + TVL] = 0;
-        names.push({ name, slug, url: post ? `${base}/tags/${slug}/` : '' });
+        names.push({ name: str(a, a + len), slug, url: post ? `${base}/tags/${slug}/` : '' });
       }
       if (trN === TR.length) {
-        const g = new Int32Array(TR.length * 2);
-        g.set(TR);
-        TR = g;
+        const grown = new Int32Array(TR.length * 2);
+        grown.set(TR);
+        TR = grown;
       }
       TR[trN++] = t;
       if (post) TG[t + TPN]++;
@@ -2684,6 +2943,137 @@ function tagPhase(u, kept, nKept, posts, nPosts, base) {
   for (let t = 0; t < nReal; t++) order.push(t);
   order.sort((x, y) => TG[y * TS + TPN] - TG[x * TS + TPN] || byCodeUnits(names[x].slug, names[y].slug));
   return { names, order };
+}
+
+// What a case's sources are read into, one source at a time.
+let REFUSED = []; // [row, reason] in the sources' order
+let DRAFTS = [];
+let LAYOUTS = new Map(); // each layout's number
+let LAYOUT_NAMES = [];
+let TAKEN = new Map(); // the slugs taken in each directory
+let POST_SLUGS = new Set();
+let SLUGS = new Map(); // each page's slug
+let PROGRAMS = new Int32Array(0); // each layout compiled: where it starts
+let tocKept = 0; // the tables of contents kept with the recent posts end here
+
+/** A source's front matter read: whether it is built (it is refused, or a draft, where it is not). */
+function admit(f) {
+  const u = B;
+  const ps = F[f + PS];
+  const post = eq(u, ps, K_POSTS) && F[f + PE] - ps >= 6;
+  let reason = frontMatter(f, F[f + BS], F[f + CE]);
+  let layout = '';
+  if (reason === null) {
+    if ((eq(u, ps, K_TAGS_SLASH) || eq(u, ps, K_PAGE_SLASH)) && F[f + PE] - ps >= 5) reason = `${BUF.latin1Slice(ps, ps + 4)}/ is the generator's own`;
+    else if (post && F[f + DATE] === 0) reason = 'a post needs a date';
+    else {
+      layout = F[f + LYL] > 0 ? BUF.latin1Slice(F[f + LYO], F[f + LYO] + F[f + LYL]) : post ? 'post' : 'page';
+      if (!TEMPLATES.has(layout)) reason = `layout "${layout}" is no template that parses`;
+    }
+  }
+  if (reason !== null) {
+    F[f + ST] = 1;
+    REFUSED.push(f, reason);
+    return false;
+  }
+  if (fmDraft === 1) {
+    F[f + ST] = 2;
+    DRAFTS.push(f);
+    return false;
+  }
+  let id = LAYOUTS.get(layout);
+  if (id === undefined) {
+    LAYOUTS.set(layout, (id = LAYOUT_NAMES.length));
+    LAYOUT_NAMES.push(layout);
+  }
+  F[f + LAY] = id;
+  F[f + POST] = post ? 1 : 0;
+  F[f + BS] = fmBody;
+  F[f + NEWER] = F[f + OLDER] = -1;
+  return true;
+}
+
+/** A built page's slug, unique in its directory in the sources' order; its output directory, url and long date. */
+function permalink(f) {
+  const u = B;
+  const ps = F[f + PS];
+  const post = F[f + POST] === 1;
+  const dirLen = post ? 0 : F[f + DE] - ps;
+  let set = POST_SLUGS;
+  if (!post) {
+    const dir = dirLen === 0 ? '' : BUF.latin1Slice(ps, ps + dirLen);
+    set = TAKEN.get(dir);
+    if (set === undefined) TAKEN.set(dir, (set = new Set(dir === '' ? RESERVED : [])));
+  }
+  room(16 * (F[f + PE] - ps) + 6 * BASE_EL + 2048);
+  let slug;
+  if (F[f + SKL] > 0) slug = BUF.latin1Slice(F[f + SKO], F[f + SKO] + F[f + SKL]);
+  else {
+    const len = k_slug(u, F[f + TRO], F[f + TRO] + F[f + TRL], sp);
+    slug = len < 0 ? slugify(str(F[f + TRO], F[f + TRO] + F[f + TRL])) : BUF.latin1Slice(sp, sp + len);
+  }
+  slug = uniqueSlug(slug, set);
+  SLUGS.set(f, slug);
+  // "<directory>/<slug>", then the url
+  F[f + KO] = sp;
+  if (post) sp = k_lit(u, sp, K_POSTS);
+  else if (dirLen > 0) {
+    sp = k_cpy(u, sp, ps, dirLen);
+    u[sp++] = 47;
+  }
+  F[f + SLO] = sp;
+  sp += BUF.latin1Write(slug, sp);
+  F[f + SLL] = sp - F[f + SLO];
+  F[f + KL] = sp - F[f + KO];
+  F[f + URO] = sp;
+  sp = k_cpy(u, sp, BASE_RO, BASE_RL);
+  u[sp++] = 47;
+  sp = k_cpy(u, sp, F[f + KO], F[f + KL]);
+  u[sp++] = 47;
+  F[f + URL_] = sp - F[f + URO];
+  F[f + UEO] = sp;
+  sp = k_cpy(u, sp, BASE_EO, BASE_EL);
+  u[sp++] = 47;
+  sp = escTo(u, sp, F[f + KO], F[f + KO] + F[f + KL]);
+  u[sp++] = 47;
+  F[f + UEL] = sp - F[f + UEO];
+  if (F[f + DATE] !== 0) {
+    const date = F[f + DATE];
+    F[f + DLO] = sp;
+    sp = wnum(u, sp, date % 100);
+    u[sp++] = 32;
+    sp = k_lit(u, sp, K_MONTHS[(((date / 100) | 0) % 100) - 1]);
+    u[sp++] = 32;
+    sp = wnum(u, sp, (date / 10000) | 0);
+    F[f + DLL] = sp - F[f + DLO];
+  }
+}
+
+/** A built page through its layout: its Markdown first, unless it is a recent post's and rendered already. */
+function page(f) {
+  const u = B;
+  if (F[f + RM] === 0) {
+    hp = HT0;
+    tcN = tocKept;
+    markdown(f);
+    if (hp > HT1) throw BAIL;
+  }
+  let pc = PROGRAMS[F[f + LAY]];
+  if (pc < 0) pc = PROGRAMS[F[f + LAY]] = compile(LAYOUT_NAMES[F[f + LAY]], 0);
+  u[op++] = 34;
+  op = k_lit(u, k_cpy(u, op, F[f + KO], F[f + KL]), K_INDEX_KEY);
+  R[0] = f;
+  exec(pc);
+  u[op] = 34; u[op + 1] = 44;
+  op += 2;
+  if (op > OUT_FLUSH) flush();
+  // What the lists show of a post outlives its page: its excerpt.
+  if (F[f + XO] >= HT0 && F[f + POST] === 1) {
+    room(F[f + XL] + 65536);
+    const at = sp;
+    sp = k_cpy(u, sp, F[f + XO], F[f + XL]);
+    F[f + XO] = at;
+  }
 }
 
 /** One case's answer written at op: its input is the JSON object that opens at c0. */
@@ -2754,13 +3144,9 @@ function answer(c0) {
   for (let f = 0; f < n * FS; f += FS) {
     const ps = F[f + PS];
     const pe = F[f + PE];
-    if (pe === ps || u[ps] === 47) throw BAIL;
-    let slash = ps;
-    for (let q = ps; q < pe; q++) {
-      const c = u[q];
-      if (c < 32 || c > 126 || c === 34 || c === 92) throw BAIL;
-      if (c === 47) slash = q;
-    }
+    if (pe === ps || u[ps] === 47 || k_find(u, ps, pe, 5, 0) >= 0) throw BAIL;
+    let slash = pe - 1;
+    while (slash > ps && u[slash] !== 47) slash--;
     F[f + DE] = slash;
     if (pe - ps >= 3 && eq(u, pe - 3, K_MD)) md.push(f);
     else {
@@ -2776,11 +3162,20 @@ function answer(c0) {
       if (F[a + PE] - F[a + PS] === F[b + PE] - F[b + PS] && same(u, F[a + PS], F[b + PS], F[a + PE] - F[a + PS])) throw BAIL;
     }
   }
-  const paths = new Map();
-  for (const f of md) paths.set(f, BUF.latin1Slice(F[f + PS], F[f + PE]));
-  md.sort((x, y) => byCodeUnits(paths.get(x), paths.get(y)));
-  // No source's path opens another's: then the report's lines sort as the sources do.
-  for (let k = 1; k < md.length; k++) if (paths.get(md[k]).startsWith(paths.get(md[k - 1]))) throw BAIL;
+  // The sources in the order of their paths (as strings sort: by code unit). No source's path opens another's: then
+  // the report's lines sort as the sources do.
+  const rowOf = new Map();
+  const names = [];
+  for (const f of md) {
+    const name = BUF.latin1Slice(F[f + PS], F[f + PE]);
+    names.push(name);
+    rowOf.set(name, f);
+  }
+  names.sort();
+  for (let k = 0; k < names.length; k++) {
+    if (k > 0 && names[k].startsWith(names[k - 1])) throw BAIL;
+    md[k] = rowOf.get(names[k]);
+  }
 
   const report = [];
   TEMPLATES = parseTemplates(sources, report);
@@ -2805,103 +3200,22 @@ function answer(c0) {
   // Front matter: which sources are built, and why the others are not.
   const kept = new Int32Array(md.length);
   let nKept = 0;
-  const refused = []; // [row, reason] in the sources' order
-  const drafts = [];
-  const layouts = new Map();
-  const layoutNames = [];
-  for (const f of md) {
-    const ps = F[f + PS];
-    const post = eq(u, ps, K_POSTS) && F[f + PE] - ps >= 6;
-    let reason = frontMatter(f, F[f + BS], F[f + CE]);
-    let layout = '';
-    if (reason === null) {
-      if ((eq(u, ps, K_TAGS_SLASH) || eq(u, ps, K_PAGE_SLASH)) && F[f + PE] - ps >= 5) reason = `${BUF.latin1Slice(ps, ps + 4)}/ is the generator's own`;
-      else if (post && F[f + DATE] === 0) reason = 'a post needs a date';
-      else {
-        layout = F[f + LYL] > 0 ? BUF.latin1Slice(F[f + LYO], F[f + LYO] + F[f + LYL]) : post ? 'post' : 'page';
-        if (!TEMPLATES.has(layout)) reason = `layout "${layout}" is no template that parses`;
-      }
-    }
-    if (reason !== null) {
-      F[f + ST] = 1;
-      refused.push(f, reason);
-      continue;
-    }
-    if (fmDraft === 1) {
-      F[f + ST] = 2;
-      drafts.push(f);
-      continue;
-    }
-    let id = layouts.get(layout);
-    if (id === undefined) {
-      layouts.set(layout, (id = layoutNames.length));
-      layoutNames.push(layout);
-    }
-    F[f + LAY] = id;
-    F[f + POST] = post ? 1 : 0;
-    F[f + BS] = fmBody;
-    F[f + NEWER] = F[f + OLDER] = -1;
-    kept[nKept++] = f;
-  }
+  REFUSED = [];
+  DRAFTS = [];
+  LAYOUTS = new Map();
+  LAYOUT_NAMES = [];
+  nmN = 0;
+  NH.fill(0);
+  for (const f of md) if (admit(f)) kept[nKept++] = f;
 
-  // Permalinks: each page's slug, unique in its directory in the sources' order; its directory and url.
-  const taken = new Map();
-  const postSlugs = new Set();
-  const slugs = new Map();
-  for (let k = 0; k < nKept; k++) {
-    const f = kept[k];
-    const ps = F[f + PS];
-    const post = F[f + POST] === 1;
-    const dirLen = post ? 0 : F[f + DE] - ps;
-    let set = postSlugs;
-    if (!post) {
-      const dir = dirLen === 0 ? '' : BUF.latin1Slice(ps, ps + dirLen);
-      set = taken.get(dir);
-      if (set === undefined) taken.set(dir, (set = new Set(dir === '' ? RESERVED : [])));
-    }
-    room(16 * (F[f + PE] - ps) + 6 * BASE_EL + 2048);
-    let slug;
-    if (F[f + SKL] > 0) slug = BUF.latin1Slice(F[f + SKO], F[f + SKO] + F[f + SKL]);
-    else {
-      const len = slugBytes(u, F[f + TRO], F[f + TRO] + F[f + TRL], sp);
-      slug = len < 0 ? slugify(str(F[f + TRO], F[f + TRO] + F[f + TRL])) : BUF.latin1Slice(sp, sp + len);
-    }
-    slug = uniqueSlug(slug, set);
-    slugs.set(f, slug);
-    // "<directory>/<slug>", then the url
-    F[f + KO] = sp;
-    if (post) sp = lit(u, sp, K_POSTS);
-    else if (dirLen > 0) {
-      sp = cpy(u, sp, ps, dirLen);
-      u[sp++] = 47;
-    }
-    F[f + SLO] = sp;
-    sp += BUF.latin1Write(slug, sp);
-    F[f + SLL] = sp - F[f + SLO];
-    F[f + KL] = sp - F[f + KO];
-    F[f + URO] = sp;
-    sp = cpy(u, sp, BASE_RO, BASE_RL);
-    u[sp++] = 47;
-    sp = cpy(u, sp, F[f + KO], F[f + KL]);
-    u[sp++] = 47;
-    F[f + URL_] = sp - F[f + URO];
-    F[f + UEO] = sp;
-    sp = cpy(u, sp, BASE_EO, BASE_EL);
-    u[sp++] = 47;
-    sp = escTo(u, sp, F[f + KO], F[f + KO] + F[f + KL]);
-    u[sp++] = 47;
-    F[f + UEL] = sp - F[f + UEO];
-    if (F[f + DATE] !== 0) {
-      const date = F[f + DATE];
-      F[f + DLO] = sp;
-      sp = wnum(u, sp, date % 100);
-      u[sp++] = 32;
-      sp = lit(u, sp, K_MONTHS[(((date / 100) | 0) % 100) - 1]);
-      u[sp++] = 32;
-      sp = wnum(u, sp, (date / 10000) | 0);
-      F[f + DLL] = sp - F[f + DLO];
-    }
-  }
+  // Permalinks, in the sources' order.
+  TAKEN = new Map();
+  POST_SLUGS = new Set();
+  SLUGS = new Map();
+  for (let k = 0; k < nKept; k++) permalink(kept[k]);
+  const slugs = SLUGS;
+  const refused = REFUSED;
+  const drafts = DRAFTS;
 
   // What links may name: the built pages and the static files.
   let size = 64;
@@ -2913,9 +3227,21 @@ function answer(c0) {
   for (const f of statics) hashPut(u, f);
 
   // The posts, newest first and then by slug; each one's neighbours.
+  // (One string a post sorts by: its date counted down, eight digits, then its slug.)
   const posts = [];
-  for (let k = 0; k < nKept; k++) if (F[kept[k] + POST] === 1) posts.push(kept[k]);
-  posts.sort((x, y) => F[y + DATE] - F[x + DATE] || byCodeUnits(slugs.get(x), slugs.get(y)));
+  {
+    const postOf = new Map();
+    const keys = [];
+    for (let k = 0; k < nKept; k++) {
+      const f = kept[k];
+      if (F[f + POST] !== 1) continue;
+      const key = (99999999 - F[f + DATE]) + slugs.get(f);
+      keys.push(key);
+      postOf.set(key, f);
+    }
+    keys.sort();
+    for (const key of keys) posts.push(postOf.get(key));
+  }
   const nPosts = posts.length;
   if (nPosts > PO.length) PO = new Int32Array(nPosts * 2);
   for (let k = 0; k < nPosts; k++) {
@@ -2935,7 +3261,7 @@ function answer(c0) {
     markdown(f);
     sp = hp;
   }
-  const tocKept = tcN; // their tables of contents are kept with them
+  tocKept = tcN; // their tables of contents are kept with them
   const tagOf = (t) => ({ name: tags.names[t / TS].name, slug: tags.names[t / TS].slug, url: tags.names[t / TS].url });
   const cardOf = (f) => {
     const own = [];
@@ -2962,32 +3288,8 @@ function answer(c0) {
 
   // Every page through its layout.
   u[op++] = 123;
-  const programs = new Int32Array(layoutNames.length).fill(-1);
-  for (let k = 0; k < nKept; k++) {
-    const f = kept[k];
-    if (F[f + RM] === 0) {
-      hp = HT0;
-      tcN = tocKept;
-      markdown(f);
-      if (hp > HT1) throw BAIL;
-    }
-    let pc = programs[F[f + LAY]];
-    if (pc < 0) pc = programs[F[f + LAY]] = compile(layoutNames[F[f + LAY]], 0);
-    u[op++] = 34;
-    op = lit(u, cpy(u, op, F[f + KO], F[f + KL]), K_INDEX_KEY);
-    R[0] = f;
-    exec(pc);
-    u[op] = 34; u[op + 1] = 44;
-    op += 2;
-    if (op > OUT1) throw BAIL;
-    // What the lists show of a post outlives its page: its excerpt.
-    if (F[f + XO] >= HT0 && F[f + POST] === 1) {
-      room(F[f + XL] + 65536);
-      const at = sp;
-      sp = cpy(u, sp, F[f + XO], F[f + XL]);
-      F[f + XO] = at;
-    }
-  }
+  PROGRAMS = new Int32Array(LAYOUT_NAMES.length).fill(-1);
+  for (let k = 0; k < nKept; k++) page(kept[k]);
 
   // The index pages, each tag's page and the tags page.
   if (TEMPLATES.has('index')) {
@@ -2997,11 +3299,11 @@ function answer(c0) {
       idxLo = (pgN - 1) * per;
       idxHi = Math.min(pgN * per, nPosts);
       u[op++] = 34;
-      op = pgN > 1 ? lit(u, wnum(u, lit(u, op, K_PAGE_DIR), pgN), K_INDEX_KEY) : lit(u, op, K_INDEX_ROOT);
+      op = pgN > 1 ? k_lit(u, wnum(u, k_lit(u, op, K_PAGE_DIR), pgN), K_INDEX_KEY) : k_lit(u, op, K_INDEX_ROOT);
       exec(pc);
       u[op] = 34; u[op + 1] = 44;
       op += 2;
-      if (op > OUT1) throw BAIL;
+      if (op > OUT_FLUSH) flush();
     }
   }
   if (TEMPLATES.has('tag')) {
@@ -3009,37 +3311,39 @@ function answer(c0) {
     for (const t of tags.order) {
       const g = t * TS;
       u[op++] = 34;
-      op = cpy(u, lit(u, op, K_TAGS_SLASH), TG[g + TSO], TG[g + TSL]);
-      op = lit(u, op, K_INDEX_KEY);
+      op = k_cpy(u, k_lit(u, op, K_TAGS_SLASH), TG[g + TSO], TG[g + TSL]);
+      op = k_lit(u, op, K_INDEX_KEY);
       R[0] = g;
       exec(pc);
       u[op] = 34; u[op + 1] = 44;
       op += 2;
-      if (op > OUT1) throw BAIL;
+      if (op > OUT_FLUSH) flush();
     }
   }
   if (TEMPLATES.has('tags')) {
     const pc = compile('tags', 3);
     u[op++] = 34;
-    op = lit(u, lit(u, op, K_TAGS_SLASH) - 1, K_INDEX_KEY);
+    op = k_lit(u, k_lit(u, op, K_TAGS_SLASH) - 1, K_INDEX_KEY);
     exec(pc);
     u[op] = 34; u[op + 1] = 44;
     op += 2;
   }
 
   // Each static file at its own path, its text as given.
+  flush();
   for (const f of statics) {
     if (op + (F[f + CE] - F[f + PS]) + 64 > OUT1) throw BAIL;
     u[op++] = 34;
-    op = cpy(u, op, F[f + PS], F[f + PE] - F[f + PS]);
+    op = k_cpy(u, op, F[f + PS], F[f + PE] - F[f + PS]);
     u[op] = 34; u[op + 1] = 58; u[op + 2] = 34;
-    op = cpy(u, op + 3, F[f + BS], F[f + CE] - F[f + BS]);
+    op = k_cpy(u, op + 3, F[f + BS], F[f + CE] - F[f + BS]);
     u[op] = 34; u[op + 1] = 44;
     op += 2;
   }
 
   // The report: every line sorted, then the counts.
-  op = lit(u, op, K_REPORT_KEY);
+  flush();
+  op = k_lit(u, op, K_REPORT_KEY);
   for (let k = 0; k < nKept; k++) {
     const f = kept[k];
     const count = F[f + BRN];
@@ -3058,24 +3362,25 @@ function answer(c0) {
       BR[b0 + 2 * y + 2] = a;
       BR[b0 + 2 * y + 3] = len;
     }
+    if (op > OUT_FLUSH) flush();
     if (op + count * (F[f + PE] - F[f + PS] + 32) > OUT1) throw BAIL;
     for (let x = 0; x < count; x++) {
       const len = BR[b0 + 2 * x + 1];
       if (op + len + 64 > OUT1) throw BAIL;
-      op = cpy(u, lit(u, op, K_BROKEN), F[f + PS], F[f + PE] - F[f + PS]);
-      op = cpy(u, lit(u, op, K_ARROW), BR[b0 + 2 * x], len);
+      op = k_cpy(u, k_lit(u, op, K_BROKEN), F[f + PS], F[f + PE] - F[f + PS]);
+      op = k_cpy(u, k_lit(u, op, K_ARROW), BR[b0 + 2 * x], len);
       u[op] = 92; u[op + 1] = 110;
       op += 2;
     }
   }
   for (const f of drafts) {
-    op = cpy(u, lit(u, op, K_DRAFT), F[f + PS], F[f + PE] - F[f + PS]);
+    op = k_cpy(u, k_lit(u, op, K_DRAFT), F[f + PS], F[f + PE] - F[f + PS]);
     u[op] = 92; u[op + 1] = 110;
     op += 2;
   }
   for (let k = 0; k < refused.length; k += 2) {
     const f = refused[k];
-    op = cpy(u, lit(u, op, K_REFUSED), F[f + PS], F[f + PE] - F[f + PS]);
+    op = k_cpy(u, k_lit(u, op, K_REFUSED), F[f + PS], F[f + PE] - F[f + PS]);
     u[op] = 58; u[op + 1] = 32;
     op += 2;
     const reason = jsonText(refused[k + 1]);
@@ -3116,14 +3421,12 @@ class Input {
 }
 
 class Answer {
-  constructor(a, b) {
-    this.a = a;
-    this.b = b;
+  constructor(index) {
+    this.index = index;
   }
 }
 
 const N_INPUT = Buffer.from('","input":');
-const N_CASE = Buffer.from(']}},{"id":"');
 const K_ID_KEY = bytes('{"id":"');
 let FILE = '';
 
@@ -3132,11 +3435,12 @@ function open(file) {
   const fd = openSync(file, 'r');
   let size = 0;
   try {
-    size = fstatSync(fd).size;
-    const out = size * 6 + (16 << 20);
-    const scr = size * 3 + (8 << 20);
+    size = fstatSync(fd).size | 0; // a small integer from here on: every place in the store is computed from it
+    if (size < 2 || size > 400_000_000) throw BAIL;
+    const out = 6 << 20;
+    const scr = size * 2 + (4 << 20);
     const tmp = 1 << 16;
-    const html = size * 2 + (4 << 20);
+    const html = size * 2 + (2 << 20);
     const total = size + 16 + out + scr + tmp + html;
     BUF = Buffer.allocUnsafeSlow(total);
     B = new Uint8Array(BUF.buffer, BUF.byteOffset, total);
@@ -3148,11 +3452,12 @@ function open(file) {
       if (n <= 0) break;
       got += n;
     }
-    if (got !== size || size < 2) throw BAIL;
+    if (got !== size) throw BAIL;
     B[size] = 92; // every search for a backslash ends here at the latest
     B[size + 1] = 110;
     OUT0 = size + 16;
     OUT1 = OUT0 + out - 4096;
+    OUT_FLUSH = OUT0 + (256 << 10);
     SCR0 = OUT0 + out;
     SCR1 = SCR0 + scr - 4096;
     TMP0 = SCR0 + scr;
@@ -3160,32 +3465,33 @@ function open(file) {
     HT0 = TMP0 + tmp;
     HT1 = total - 4096;
     op = OUT0;
+    outFd = -1;
+    failed = false;
   } finally {
     closeSync(fd);
   }
+  prime();
   if (B[0] !== 91 || !eq(B, 1, K_ID_KEY)) throw BAIL;
   const q = IN.indexOf(N_INPUT, 8);
   if (q < 0) throw BAIL;
   return q + 10;
 }
 
-/** Each case's input in turn, as a place in the store. The next one opens where run() found the last one ended. */
+/**
+ * Each case's input in turn, as a place in the store. The next one opens where run() found the last one ended; where
+ * run() did not get that far (or the file is not laid out as this path reads it), the cases left are handed over
+ * parsed.
+ */
 function* inputs(first) {
   const u = B;
   let at = first;
   for (let index = 0; ; index++) {
     inputEnd = -1;
     yield new Input(index, at);
-    let end = inputEnd;
-    if (end < 0) {
-      // build() answered it (or nobody did): the input ends where the next case opens, or with the file
-      const e = IN.indexOf(N_CASE, at);
-      end = e < 0 ? SIZE - 2 : e + 2;
-    }
-    if (u[end] === 125 && u[end + 1] === 93 && end + 2 === SIZE) return;
-    const q = u[end] === 125 && u[end + 1] === 44 && eq(u, end + 2, K_ID_KEY) ? IN.indexOf(N_INPUT, end + 9) : -1;
+    const end = inputEnd;
+    if (end >= 0 && u[end] === 125 && u[end + 1] === 93 && end + 2 === SIZE) return;
+    const q = end >= 0 && u[end] === 125 && u[end + 1] === 44 && eq(u, end + 2, K_ID_KEY) ? IN.indexOf(N_INPUT, end + 9) : -1;
     if (q < 0) {
-      // Not the file this path reads: the cases left are handed over parsed.
       const all = JSON.parse(readFileSync(FILE, 'utf8'));
       for (let k = index + 1; k < all.length; k++) yield all[k].input;
       return;
@@ -3195,8 +3501,9 @@ function* inputs(first) {
 }
 
 /** Every case's input, read from cases.json: what run() takes, one at a time. */
-export function cases(file) {
+export function cases(file, answersFile) {
   FILE = file ?? `${process.env.MAKEFUN_INPUT_DIR ?? '/input'}/cases.json`;
+  outFile = answersFile ?? `${process.env.MAKEFUN_OUTPUT_DIR ?? '/output'}/answers.json`;
   let first = 0;
   try {
     first = open(FILE);
@@ -3207,44 +3514,48 @@ export function cases(file) {
   return inputs(first);
 }
 
-/** makefun-site 1.0.0's answer for one case's input. */
+/**
+ * makefun-site 1.0.0's answer for one case's input: an object of path to text for a parsed input; for an input from
+ * cases(), the same answer as JSON text, written toward answers.json as it is made (the Answer says which case).
+ */
 export function run(input) {
   if (!(input instanceof Input)) return build(input);
-  const o0 = op;
-  try {
-    B[op++] = o0 === OUT0 ? 91 : 44;
-    const a = op;
-    answer(input.at);
-    return new Answer(a, op);
-  } catch (err) {
-    if (DEBUG) throw err;
-    op = o0;
-    inputEnd = -1;
-    return build(JSON.parse(readFileSync(FILE, 'utf8'))[input.index].input);
+  if (!failed) {
+    try {
+      B[op++] = input.index === 0 ? 91 : 44;
+      answer(input.at);
+      return new Answer(input.index);
+    } catch (err) {
+      if (DEBUG) throw err;
+      failed = true;
+      inputEnd = -1;
+    }
   }
+  return null; // left to answers(): this file is answered whole by build()
 }
 
-/** The answers written as answers.json, one per case and in the cases' order. */
+/** The answers finished as answers.json, one per case and in the cases' order. */
 export function answers(list, file) {
-  const path = file ?? `${process.env.MAKEFUN_OUTPUT_DIR ?? '/output'}/answers.json`;
-  let whole = list.length > 0;
-  let at = OUT0 + 1;
-  for (const a of list) {
-    if (!(a instanceof Answer) || a.a !== at) {
-      whole = false;
-      break;
-    }
-    at = a.b + 1;
-  }
-  if (whole && at === op + 1) {
-    B[op] = 93;
-    const fd = openSync(path, 'w');
+  const path = file ?? outFile;
+  let whole = !failed && list.length > 0 && path === outFile;
+  for (let k = 0; whole && k < list.length; k++) whole = list[k] instanceof Answer && list[k].index === k;
+  if (whole) {
     try {
-      for (let a = OUT0, end = op + 1; a < end; ) a += writeSync(fd, BUF, a, end - a);
-    } finally {
-      closeSync(fd);
+      B[op++] = 93;
+      flush();
+      closeSync(outFd);
+      outFd = -1;
+      return;
+    } catch (err) {
+      if (DEBUG) throw err;
     }
-    return;
   }
-  writeFileSync(path, `[${list.map((a) => (a instanceof Answer ? BUF.utf8Slice(a.a, a.b) : JSON.stringify(a))).join(',')}]`);
+  if (outFd >= 0) {
+    closeSync(outFd);
+    outFd = -1;
+  }
+  // Not every case went the byte path (or none did): each parsed input is answered by build().
+  const parsed = FILE === '' ? [] : JSON.parse(readFileSync(FILE, 'utf8'));
+  const out = list.map((a, k) => (a instanceof Answer || a === null ? build(parsed[k].input) : a));
+  writeFileSync(path, JSON.stringify(out));
 }
