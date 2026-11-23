@@ -7,6 +7,7 @@
 // read, is answered by build(), a plain reading of the same rules. Each case is answered alone.
 
 import { closeSync, fstatSync, openSync, readFileSync, readSync, writeFileSync, writeSync } from 'node:fs';
+import { setFlagsFromString } from 'node:v8';
 
 // ---------------------------------------------------------------- text rules (strings)
 
@@ -525,8 +526,19 @@ function wordsOf(text) {
   return m === null ? 0 : m.length;
 }
 
+let everyTier = false;
+
 /** One site's output tree, path to text: makefun-site's rules in the order its README gives them. */
 export function build(input) {
+  if (!everyTier) {
+    // The driver lets V8 optimize the byte path's kernels alone; this path is long work, so here it may optimize all.
+    everyTier = true;
+    try {
+      setFlagsFromString('--turbo-filter=*');
+    } catch {
+      // as it was
+    }
+  }
   const report = [];
   const templates = parseTemplates(input.templates, report);
   const base = input.site.base_url.replace(/\/+$/, '');
@@ -1810,7 +1822,6 @@ function markdown(f) {
   F[f + RM] = words <= 200 ? 1 : ((words + 199) / 200) | 0;
   F[f + BR0] = brAt;
   F[f + BRN] = (brN - brAt) >> 1;
-  if (DEBUG) globalThis.__mfWords?.push(words);
 }
 
 // ---- the kernels made ready
